@@ -1,0 +1,124 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Dict, Any
+import fitz  # PyMuPDF
+import openai
+import databases
+import sqlalchemy
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/workflowdb")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your_openai_api_key")
+openai.api_key = OPENAI_API_KEY
+
+database = databases.Database(DATABASE_URL)
+metadata = sqlalchemy.MetaData()
+
+documents = sqlalchemy.Table(
+    "documents",
+    metadata,
+    sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("filename", sqlalchemy.String, nullable=False),
+    sqlalchemy.Column("content", sqlalchemy.Text, nullable=False),
+)
+
+workflows = sqlalchemy.Table(
+    "workflows",
+    metadata,
+    sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("name", sqlalchemy.String, nullable=False),
+    sqlalchemy.Column("definition", sqlalchemy.JSON, nullable=False),
+)
+
+chat_logs = sqlalchemy.Table(
+    "chat_logs",
+    metadata,
+    sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("workflow_id", sqlalchemy.Integer, sqlalchemy.ForeignKey("workflows.id")),
+    sqlalchemy.Column("user_query", sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column("response", sqlalchemy.Text, nullable=False),
+)
+
+engine = sqlalchemy.create_engine(DATABASE_URL)
+metadata.create_all(engine)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class WorkflowDefinition(BaseModel):
+    name: str
+    definition: Dict[str, Any]
+
+class QueryRequest(BaseModel):
+    workflow_id: int
+    query: str
+
+class QueryResponse(BaseModel):
+    response: str
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    full_text = ""
+    for page in doc:
+        full_text += page.get_text()
+    return full_text
+
+async def call_llm(prompt: str) -> str:
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=500,
+        temperature=0.7,
+    )
+    return response['choices'][0]['message']['content']
+
+@app.on_event("startup")
+async def startup():
+    await database.connect()
+
+@app.on_event("shutdown")
+async def shutdown():
+    await database.disconnect()
+
+@app.post("/upload-document/")
+async def upload_document(file: UploadFile = File(...)):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files supported")
+    content = await file.read()
+    text = extract_text_from_pdf(content)
+    query = documents.insert().values(filename=file.filename, content=text)
+    doc_id = await database.execute(query)
+    return {"doc_id": doc_id, "message": "Document uploaded and text extracted"}
+
+@app.post("/save-workflow/")
+async def save_workflow(workflow: WorkflowDefinition):
+    query = workflows.insert().values(name=workflow.name, definition=workflow.definition)
+    workflow_id = await database.execute(query)
+    return {"workflow_id": workflow_id}
+
+@app.post("/run-workflow/", response_model=QueryResponse)
+async def run_workflow(request: QueryRequest):
+    query = workflows.select().where(workflows.c.id == request.workflow_id)
+    wf = await database.fetch_one(query)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    user_query = request.query
+    prompt = f"User  query: {user_query}\nAnswer:"
+    llm_response = await call_llm(prompt)
+
+    await database.execute(chat_logs.insert().values(
+        workflow_id=request.workflow_id,
+        user_query=user_query,
+        response=llm_response
+    ))
+
+    return QueryResponse(response=llm_response)
